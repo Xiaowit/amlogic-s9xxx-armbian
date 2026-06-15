@@ -1,0 +1,215 @@
+#==========================================================================
+# Description: Build Armbian for HG680P (S905x)
+# Board: HG680P — Amlogic S905x
+# Maintainer: 0xygen
+#==========================================================================
+
+name: Build Armbian HG680P S905x
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+    inputs:
+      armbian_board:
+        description: "Device board"
+        required: false
+        default: "s905x"
+        type: choice
+        options:
+          - s905x
+      armbian_kernel:
+        description: "Kernel version"
+        required: false
+        default: "6.1.y"
+        type: choice
+        options:
+          - 6.1.y
+          - 6.6.y
+          - 6.12.y
+      auto_kernel:
+        description: "Auto use latest kernel in series"
+        required: false
+        default: true
+        type: boolean
+      kernel_repo:
+        description: "Kernel repository"
+        required: false
+        default: "ophub/kernel"
+        type: choice
+        options:
+          - ophub/kernel
+      kernel_usage:
+        description: "Kernel stability tag"
+        required: false
+        default: "stable"
+        type: choice
+        options:
+          - stable
+          - flippy
+          - beta
+      armbian_fstype:
+        description: "Root filesystem type"
+        required: false
+        default: "ext4"
+        type: choice
+        options:
+          - ext4
+          - btrfs
+      builder_name:
+        description: "Builder signature"
+        required: false
+        default: "0xygen"
+        type: choice
+        options:
+          - 0xygen
+          - ophub
+
+env:
+  TZ: Asia/Makassar
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    if: ${{ github.event.repository.owner.id == github.event.sender.id }}
+    permissions:
+      contents: write
+
+    name: Build HG680P Noble Server
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Initialize the build environment
+        id: init
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          docker rmi -f $(docker images -q) 2>/dev/null || true
+          [[ -n "${AGENT_TOOLSDIRECTORY}" ]] && sudo rm -rf "${AGENT_TOOLSDIRECTORY}"
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android 2>/dev/null
+          sudo swapoff -a
+          sudo rm -f /swapfile /mnt/swapfile
+          sudo -E apt-get -y update
+          sudo -E apt-get -y purge azure-cli ghc* zulu* llvm* firefox google* dotnet* powershell openjdk* mongodb* moby* || true
+          sudo -E apt-get -y install $(curl -fsSL https://ophub.org/ubuntu2404-build-armbian-depends)
+          sudo -E systemctl daemon-reload
+          sudo -E apt-get -y autoremove --purge
+          sudo -E apt-get clean
+          sudo sed -i '/NVM_DIR/d;/skel/d' /root/{.bashrc,.profile}
+          sudo rm -rf ~/{.cargo,.dotnet,.rustup}
+          sudo -E timedatectl set-timezone "${TZ}"
+          sudo -E ntpdate ntp.ubuntu.com 0.pool.ntp.org || true
+          sudo -E timedatectl set-ntp true
+          date -u
+          timedatectl status || true
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Create virtual disk for extended storage
+        id: disk
+        run: |
+          root_avail=$(df --block-size=1G / | tail -1 | awk '{print $4}')
+          root_size=$(( root_avail - 4 ))
+          [[ "${root_size}" -gt 0 ]] || { echo "Error: Insufficient space on /: ${root_avail}G available"; exit 1; }
+
+          sudo truncate -s "${root_size}"G /root.img
+          build_dev=$(sudo losetup --find --show /root.img)
+          echo "Using /: ${root_size}G"
+
+          sudo mkfs.xfs -f -i sparse=0 -b size=4096 "${build_dev}"
+          sudo mkdir -p /builder
+          sudo mount "${build_dev}" /builder
+          sudo chown -R runner:runner /builder
+          df -Th
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Download Armbian Noble base image
+        id: down
+        working-directory: /builder
+        if: ${{ steps.init.outputs.status == 'success' && !cancelled() }}
+        run: |
+          armbian_buildpath="build/output/images"
+          [[ -d "${armbian_buildpath}" ]] || mkdir -p "${armbian_buildpath}"
+          ln -sf /builder/build ${{ github.workspace }}/build
+          ln -sf /builder/build /home/runner/work/_actions/ophub/amlogic-s9xxx-armbian/main/build
+
+          # Try downloading from own releases first
+          latest_version=$(curl -s \
+              -H "Accept: application/vnd.github+json" \
+              -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+              https://api.github.com/repos/${{ github.repository }}/releases?per_page=20 | \
+              jq -r --arg RTK "Armbian_noble_arm64_" \
+              --arg BOARD "-trunk_" \
+              '[.[] | select(.tag_name | contains($RTK))] |
+              map(.assets[] | select(.name | contains($BOARD) and endswith(".img.gz"))) |
+              sort_by(.updated_at) |
+              reverse |
+              .[0] |
+              {data: .updated_at, url: .url, name: .name}')
+
+          if [[ -z "${latest_version}" || "${latest_version}" == "null" ]]; then
+              # Fallback: download official Armbian Noble server image
+              echo "No release found, downloading from official Armbian mirror..."
+              armbian_site="https://armbian.tnahosting.net/dl/odroidn2/archive/"
+              armbian_name="Armbian.*noble.*server.*.img.xz"
+              armbian_file=$(curl -s "${armbian_site}" | grep -oE "${armbian_name}" | head -n 1)
+              if [[ -n "${armbian_file}" ]]; then
+                  armbian_url="${armbian_site}${armbian_file}"
+                  echo "Downloading: ${armbian_file}"
+                  curl -fsSL "${armbian_url}" -o "${armbian_buildpath}/${armbian_file}"
+              else
+                  echo "Error: No valid Armbian Noble server image found."
+                  exit 1
+              fi
+          else
+              latest_url="$(echo ${latest_version} | jq -r '.url')"
+              armbian_filename="$(echo ${latest_version} | jq -r '.name')"
+              echo "Downloading: ${armbian_filename}"
+              curl -fsSL \
+                   -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}" \
+                   -H "Accept: application/octet-stream" \
+                   "${latest_url}" \
+                   -o "${armbian_buildpath}/${armbian_filename}"
+              [[ "${?}" -ne "0" ]] && echo "Error: Download failed." && exit 1
+          fi
+
+          echo "build_tag=Armbian_HG680P_noble_arm64_server_$(date +"%Y.%m.%d")" >> ${GITHUB_ENV}
+          echo "status=success" >> ${GITHUB_OUTPUT}
+
+      - name: Rebuild Armbian for HG680P S905x
+        uses: ophub/amlogic-s9xxx-armbian@main
+        if: ${{ steps.down.outputs.status == 'success' && !cancelled() }}
+        with:
+          build_target: armbian
+          armbian_path: build/output/images/*.img*
+          armbian_board: ${{ inputs.armbian_board }}
+          armbian_kernel: ${{ inputs.armbian_kernel }}
+          auto_kernel: ${{ inputs.auto_kernel }}
+          kernel_repo: ${{ inputs.kernel_repo }}
+          kernel_usage: ${{ inputs.kernel_usage }}
+          armbian_fstype: ${{ inputs.armbian_fstype }}
+          builder_name: ${{ inputs.builder_name }}
+
+      - name: Upload Armbian HG680P to Release
+        uses: ophub/upload-to-releases@main
+        if: ${{ env.PACKAGED_STATUS == 'success' && !cancelled() }}
+        with:
+          tag: ${{ env.build_tag }}
+          artifacts: ${{ env.PACKAGED_OUTPUTPATH }}/*
+          allow_updates: true
+          remove_artifacts: false
+          replaces_artifacts: true
+          make_latest: true
+          gh_token: ${{ secrets.GITHUB_TOKEN }}
+          body: |
+            ### Armbian HG680P (S905x) — Built by 0xygen
+            - 📦 **Board:** HG680P (Amlogic S905x)
+            - 🐧 **OS:** Ubuntu Noble (24.04) Server
+            - 🔧 **Kernel:** 6.1.y stable (latest)
+            - 💾 **Filesystem:** ${{ inputs.armbian_fstype }}
+            - 🏗️ **Builder:** ${{ inputs.builder_name }}
+            ---
+            - Default username: `root`
+            - Default password: `1234`
+            - Install to eMMC: `armbian-install`
+            - Update kernel: `armbian-update`
